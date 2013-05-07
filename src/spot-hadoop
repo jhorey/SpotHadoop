@@ -1,0 +1,234 @@
+#!/bin/bash
+
+# Copyright 2013 Oak Ridge National Laboratory
+# Original Author: Seung-Hwan Lim <lims1@ornl.gov> 
+# Supplemental Author: James Horey <horeyjl@ornl.gov>
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This script is used to reserve machines on the cluster, launch the
+# Hadoop services, and to perform benchmarks. This is the top-level
+# script users should interact with. 
+#
+# At this time, the script is very specific to our needs and will need
+# to be modified for other environments. 
+
+
+# Set the various environment variables needed to run the script.
+# Some of these variables may be specific to ORNL and the systems
+# we use (for example project IDs, etc.). 
+f_setshell() {
+	
+	source $MODULESHOME/init/bash
+	sleep 5
+	module switch python/2.7
+	module refresh
+	PYTHON_VERSION=`python -V | awk '{print $2}'`
+	
+
+	case ${HOSTNAME} in
+		titan*) module load java 
+			export JAVA_HOME=/opt/java/jdk1.7.0_07;;
+
+		smoky*) 
+			export JAVA_HOME=/usr/lib/jvm/java-1.6.0-sun
+		#paths for directories and binaries
+			if [ -z $MPILAUNCH_HOME ]
+			then
+				MPILAUNCH_HOME=/lustre/widow2/scratch/$LOGNAME/MPILaunch
+			fi
+
+			LOCAL=$MPILAUNCH_HOME/data/network
+			GLOBAL=$MPILAUNCH_HOME/data/network/hosts
+			ENV=$MPILAUNCH_HOME/data/environment
+			DEV=eth0
+
+
+			#constants
+			PROJID="MYPROJID"
+			NODES=9
+			PROCS=16
+			TIME="2:00:00"
+			GRES="widow1%widow2"
+		;;
+	esac
+
+	export MPILAUNCH_HOME=$MPILAUNCH_HOME
+	export HADOOP_HOME=$MPILAUNCH_HOME/hadoop/hadoop-1.1.1
+	PATH=/sbin:/usr/sbin:/usr/bin:$HADOOP_HOME/bin:$MPILAUNCH_HOME/bin:$PATH
+	# Add Hadoop bin/ directory to PATH
+	export PATH=$PATH
+}
+
+# Allocate some machines either in interactive or batch mode. Our reservation
+# system uses QSUB. In theory this could be translated to other allocation
+# systems, including cloud, etc. 
+f_reserve() {
+	SUBCOMMAND=$1
+
+	case ${SUBCOMMAND} in
+	interactive*)
+		f_setshell 
+		 qsub -A $PROJID -l walltime=$TIME,nodes=$NODES:ppn=$PROCS -l gres=$GRES -V -I -m b
+		;;
+	batch*)
+		f_setshell
+		sed -i {'s/nodes=[0-9]*/nodes='$NODES'/g'} $MPILAUNCH_HOME/bin/pbs.script
+		sed -i {'s/ppn=[0-9]*/ppn='$PROCS'/g'} $MPILAUNCH_HOME/bin/pbs.script
+		
+		qsub $MPILAUNCH_HOME/bin/pbs.script
+		;;
+	*)
+		echo "Usage: spot-hadoop reserve <subcommand>"
+		echo "subcommand list"
+		echo "interactive: interactive mode"
+		echo "batch: batch mode"
+	esac	
+}
+
+# Set up the environment. This sets the environment variables and
+# also initializes the "network" (collects the relevant IP addresses
+# and host information). We need to set up the networking information
+# in this manner, because that information is only known after the allocation. 
+f_environment() {
+	f_setshell 
+	rm -rvf  $LOCAL/*
+	rm -rvf  $GLOBAL/*
+	mpirun -np $NODES -bynode  plaunch --local $LOCAL --global $GLOBAL
+}
+
+# Create the Hadoop directories, create the configuration files, and
+# launch the Hadoop daemons. 
+f_hadoop() {
+	f_setshell 
+	# Hadoop specific variables.
+	HADOOP_ARGS="-e $ENV"
+	HADOOP="python2.7 $MPILAUNCH_HOME/bin/hadooprun.py $HADOOP_ARGS "
+
+	echo "clear metadata for previous cluster setup"
+
+	rm -rvf $ENV/*
+	rm -rvf $MPILAUNCH_HOME/hadoop/conf/smoky*
+	rm -rvf $MPILAUNCH_HOME/bin/smoky*
+	rm -rvf /lustre/widow2/scratch/s52c3/med002/tmp/*
+
+	if [ ! -d /lustre/widow2/scratch/${LOGNAME}/hadoop/logs ]
+	then
+		mkdir -p /lustre/widow2/scratch/${LOGNAME}/hadoop/logs
+	fi
+
+	echo "setup network environment."
+	mpirun -np $NODES -bynode  plaunch --dir $ENV --export SPOT_HADOOP $MPILAUNCH_HOME
+	mpirun -np $NODES -bynode  plaunch --dir $ENV --export NAMENODE 0
+	mpirun -np $NODES -bynode  plaunch --dir $ENV --export JOBTRACKER 0
+	mpirun -np $NODES -bynode  plaunch --dir $ENV --export DEV $DEV
+	mpirun -np $NODES -bynode  plaunch --dir $ENV --export PROCS $PROCS
+	mpirun -np $NODES -bynode  plaunch --dir $ENV --export NUMCORES $PROCS
+
+	sleep 1
+	echo "setup hadoop configuration and start daemons."
+	mpirun -np $NODES -bynode  plaunch --cmd $HADOOP
+}
+
+# Run some basic benchmarks against the newly created Hadoop cluster. 
+f_benchmark() {
+# search for the master node
+	WORKLOAD=$1
+	ITER=$2
+	if [ ${#SUBCOMMAND} -eq 0 ] || [ ${#PARAMETER} -eq 0 ]
+	then
+		echo "Usage: spot-hadoop benchmark <benchmarkname> <num-iter>"
+		echo "benchmark "
+		echo "    teragen"
+		echo "    terasort"
+		echo "    dfsio"
+		exit 1
+	fi
+
+	f_setshell
+
+	echo "searching for the master"
+	for item in smoky*.out;
+	do
+		node=${item%%.*}
+		TEST_NAMENODE=`ssh -f $node 'jps' 2>/dev/null |grep JobTracker`
+		TEST_MASTERNODE=`echo ${TEST_NAMENODE} | awk -v node=$node '{if (NF > 1) {print node}}' | tr -d '\n'`
+		if [ ${#TEST_MASTERNODE} -ne 0 ]
+		then
+			MASTERNODE=${TEST_MASTERNODE}
+		else
+			let SLAVE_CNT=SLAVE_CNT+1
+		fi
+	done
+# if master is running, kill prior sar instances and start sar on all the nodes.
+	if [ ${#MASTERNODE} -eq 0 ] && [ $SLAVE_CNT -eq 0 ]
+	then
+		echo "hadoop is not running."
+		exit
+	fi
+	echo "Identified the master: " ${MASTERNODE} " and " ${SLAVE_CNT}" out of " ${NODES} " are slaves."
+
+	EXP_SET=1
+	RESULT_PATH=$MPILAUNCH_HOME/${WORKLOAD}/$NODES/exp_$EXP_SET
+
+	while [ -d ${RESULT_PATH} ];
+	do
+		let EXP_SET=EXP_SET+1
+		let ITER=ITER+1
+		RESULT_PATH=$MPILAUNCH_HOME/${WORKLOAD}/$NODES/exp_$EXP_SET
+	done
+	echo ${EXP_SET} "-th iteration for " ${WORKLOAD}
+#
+	for IDX in `seq ${EXP_SET} ${ITER}`;
+	do
+#		RESULT_PATH=$MPILAUNCH_HOME/$WORKLOAD/$NODES/exp_$IDX
+#		mkdir -p $RESULT_PATH
+#		echo "run sar on each node."
+#		for item in smoky*.out;
+#		do
+#			node=${item%%.*}
+#			echo $node, $COMMAND
+#			COMMAND="pgrep -u s52c3 -f sar | xargs kill"
+#			ssh -f $node "$COMMAND" 2>/dev/null
+#			COMMAND="sar -A -o ${RESULT_PATH}/sar.$node.bin 5 1440 >/dev/null "
+#			sleep 1 
+#
+#			ssh -f $node "$COMMAND" 2>/dev/null
+#		done
+#
+# next, launch a hadoop job on the master, the job is written in exp.sh
+		echo "launch a job " ${COMMAND} " from " ${hostname}
+		$MPILAUNCH_HOME/bin/exp.sh ${WORKLOAD} ${IDX} ${SLAVE_CNT}
+	done
+}
+
+# Launch the commands specified by the user. The commands must be run
+# in a particular order. 
+COMMAND=$1
+SUBCOMMAND=$2
+PARAMETER=$3
+case ${COMMAND} in
+	reserve*) f_reserve $SUBCOMMAND;;
+	environment*) f_environment ;;
+	hadoop*) f_hadoop ;;
+	benchmark*) f_benchmark $SUBCOMMAND $PARAMETER;;
+	*) echo "Usage: spot-hadoop <command>"
+	   echo "command list"
+	   echo "reserve: reserve nodes through PBS"
+	   echo "environment: set environment to create a hadoop cluster"
+	   echo "hadoop: create a hadoop cluster on allocated nodes"
+	   echo "benchmark: run a hadoop job, written in exp.sh script"
+	   exit 
+	;;
+esac
+
